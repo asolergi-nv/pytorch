@@ -860,9 +860,69 @@ class TestReplicaAwareLoad(DTensorTestBase):
         dcp.load(target, storage_reader=reader)
 
         self.assertGreater(reader.num_broadcasts, 0)
+        # The destination has the wrong dtype for the wire, so the owner had to
+        # stage through a stored-dtype scratch rather than broadcast in place.
+        self.assertGreater(reader.scratch_bytes, 0)
         for k in sd:
             self.assertEqual(target[k].to_local().dtype, torch.bfloat16)
             self.assertEqual(sd[k].to_local().to(torch.bfloat16), target[k].to_local())
+
+        dist.barrier()
+        if self.rank == 0:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @with_comms
+    def test_world_group_across_tp_shards(self):
+        """WORLD as the replication group is correct; the cost is bystanders.
+
+        Ranks holding different TP shards of one FQN want different stored
+        chunks, so their keys differ and nothing is deduplicated between them,
+        while the dp pairs still share keys and are deduplicated exactly as
+        with the dp group. What changes is that every broadcast runs over
+        WORLD, so each rank also joins the broadcasts for the other shard,
+        allocating a buffer per chunk and discarding it.
+        """
+        mesh = self._mesh(2, 2)
+        sd = self._state_dict(mesh)
+        path = self._tmpdir()
+        dcp.save(sd, storage_writer=FileSystemWriter(path, thread_count=1))
+
+        stock = self._zeros_like(sd)
+        with _count_read_bytes() as counter:
+            dcp.load(stock, storage_reader=FileSystemReader(path))
+        stock_read = self._total_read(counter["read"])
+
+        tight = self._reader(path, mesh["dp"].get_group())
+        target = self._zeros_like(sd)
+        with _count_read_bytes() as counter:
+            dcp.load(target, storage_reader=tight)
+        tight_read = self._total_read(counter["read"])
+        self._assert_equal_sd(sd, target)
+
+        wide = self._reader(path, dist.group.WORLD)
+        target = self._zeros_like(sd)
+        with _count_read_bytes() as counter:
+            dcp.load(target, storage_reader=wide)
+        wide_read = self._total_read(counter["read"])
+        self._assert_equal_sd(sd, target)
+
+        # Same deduplication either way: every stored chunk is read once. The
+        # ratio is approximate because every rank also reads the .metadata
+        # pickle through the same stream the counter hooks.
+        self.assertEqual(wide_read, tight_read)
+        self.assertAlmostEqual(stock_read / tight_read, 2, delta=0.05)
+        # Twice the broadcasts and twice the bytes on every rank: the other
+        # shard's chunks are received and thrown away.
+        self.assertEqual(wide.num_broadcasts, 2 * tight.num_broadcasts)
+        self.assertEqual(wide.bytes_exchanged, 2 * tight.bytes_exchanged)
+        # Contiguous destinations in the stored dtype on the exchange device
+        # are broadcast in place: no staging was allocated in either run.
+        self.assertEqual(tight.scratch_bytes, 0)
+        self.assertEqual(wide.scratch_bytes, 0)
+
+        dist.barrier()
+        if self.rank == 0:
+            shutil.rmtree(path, ignore_errors=True)
 
         dist.barrier()
         if self.rank == 0:

@@ -402,13 +402,15 @@ class _Schedule:
 class _CapturingPlanner:
     """Planner proxy that keeps a copy of each tensor this rank has to broadcast.
 
-    For a wanted key, ``resolve_tensor`` hands the storage layer a scratch in
-    the checkpoint's *stored* dtype rather than the destination. The scratch is
-    what goes on the wire, so every rank sizes its buffer from the metadata
-    alone; if the load changes dtype, the cast happens in each rank's own
-    ``copy_`` into its destination. Capturing the destination instead would
-    broadcast whatever dtype the model uses into buffers sized for the stored
-    one.
+    For a wanted key, ``resolve_tensor`` decides what the storage layer fills.
+    If the destination already has the checkpoint's *stored* dtype, is
+    contiguous and lives on the exchange device, the destination itself is
+    handed out and later broadcast directly: nothing extra is allocated or
+    copied. Otherwise the storage layer gets a scratch in the stored dtype,
+    that scratch goes on the wire, and ``commit_tensor`` performs the copy into
+    the destination. Either way the wire carries the stored dtype, so every
+    rank sizes its receive buffer from the metadata alone, and a load that
+    changes dtype casts at each rank's own destination.
     """
 
     def __init__(
@@ -423,6 +425,10 @@ class _CapturingPlanner:
         self._device = device
         self._metadata = metadata
         self.captured: dict[_ReadKey, torch.Tensor] = {}
+        # Destinations handed out as the wire buffer, by data_ptr, so that
+        # commit_tensor can tell them from scratches without re-resolving.
+        self._aliased: dict[_ReadKey, int] = {}
+        self.scratch_bytes = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -432,7 +438,20 @@ class _CapturingPlanner:
         if key not in self._wanted:
             return self._inner.resolve_tensor(read_item)
         dtype = _tensor_md(key, self._metadata).properties.dtype
-        return torch.empty(tuple(read_item.lengths), dtype=dtype, device=self._device)
+        target = self._inner.resolve_tensor(read_item)
+        if (
+            target.device == self._device
+            and target.dtype == dtype
+            and target.is_contiguous()
+            and tuple(target.shape) == tuple(read_item.lengths)
+        ):
+            self._aliased[key] = target.data_ptr()
+            return target
+        scratch = torch.empty(
+            tuple(read_item.lengths), dtype=dtype, device=self._device
+        )
+        self.scratch_bytes += scratch.numel() * scratch.element_size()
+        return scratch
 
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         key = _read_key(read_item)
@@ -440,6 +459,9 @@ class _CapturingPlanner:
             self._inner.commit_tensor(read_item, tensor)
             return
         self.captured[key] = tensor
+        if self._aliased.pop(key, None) == tensor.data_ptr():
+            self._inner.commit_tensor(read_item, tensor)
+            return
         target = self._inner.resolve_tensor(read_item).detach()
         target.copy_(tensor)
         self._inner.commit_tensor(read_item, target)
@@ -509,6 +531,9 @@ class ReplicaAwareStorageReader(StorageReader):
         self.num_transfers = 0
         self.read_seconds = 0.0
         self.exchange_seconds = 0.0
+        # Bytes of staging allocated because a destination could not serve as
+        # the wire buffer; zero when every owned chunk was broadcast in place.
+        self.scratch_bytes = 0
 
     # -- plumbing ----------------------------------------------------------
 
@@ -761,6 +786,8 @@ class ReplicaAwareStorageReader(StorageReader):
         started = time.perf_counter()
         self.storage_reader.read_data(inner_plan, capture or planner).wait()
         self.read_seconds += time.perf_counter() - started
+        if capture is not None:
+            self.scratch_bytes += capture.scratch_bytes
 
         if schedule.entries:
             started = time.perf_counter()
