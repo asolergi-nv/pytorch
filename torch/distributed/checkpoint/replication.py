@@ -400,40 +400,49 @@ class _Schedule:
 
 
 class _CapturingPlanner:
-    """Planner proxy that snapshots the tensors this rank has to broadcast.
+    """Planner proxy that keeps a copy of each tensor this rank has to broadcast.
 
-    We cannot re-derive them from ``resolve_tensor`` afterwards: that method
-    returns a *destination* for the storage layer to fill, and a planner is
-    free to hand back a scratch buffer and only move the data into the real
-    tensor in ``commit_tensor``. Re-resolving would broadcast an empty buffer.
+    For a wanted key, ``resolve_tensor`` hands the storage layer a scratch in
+    the checkpoint's *stored* dtype rather than the destination. The scratch is
+    what goes on the wire, so every rank sizes its buffer from the metadata
+    alone; if the load changes dtype, the cast happens in each rank's own
+    ``copy_`` into its destination. Capturing the destination instead would
+    broadcast whatever dtype the model uses into buffers sized for the stored
+    one.
     """
 
     def __init__(
-        self, planner: LoadPlanner, wanted: set[_ReadKey], device: torch.device
+        self,
+        planner: LoadPlanner,
+        wanted: set[_ReadKey],
+        device: torch.device,
+        metadata: Metadata,
     ) -> None:
         self._inner = planner
         self._wanted = wanted
         self._device = device
+        self._metadata = metadata
         self.captured: dict[_ReadKey, torch.Tensor] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
     def resolve_tensor(self, read_item: ReadItem) -> torch.Tensor:
-        return self._inner.resolve_tensor(read_item)
+        key = _read_key(read_item)
+        if key not in self._wanted:
+            return self._inner.resolve_tensor(read_item)
+        dtype = _tensor_md(key, self._metadata).properties.dtype
+        return torch.empty(tuple(read_item.lengths), dtype=dtype, device=self._device)
 
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         key = _read_key(read_item)
-        if key in self._wanted:
-            local = tensor.detach()
-            # `.to` already copies across devices; only clone when it would not
-            local = (
-                local.to(self._device)
-                if local.device != self._device
-                else local.clone()
-            )
-            self.captured[key] = local.contiguous()
-        self._inner.commit_tensor(read_item, tensor)
+        if key not in self._wanted:
+            self._inner.commit_tensor(read_item, tensor)
+            return
+        self.captured[key] = tensor
+        target = self._inner.resolve_tensor(read_item).detach()
+        target.copy_(tensor)
+        self._inner.commit_tensor(read_item, target)
 
     def load_bytes(self, read_item: ReadItem, value) -> None:
         self._inner.load_bytes(read_item, value)
@@ -743,7 +752,11 @@ class ReplicaAwareStorageReader(StorageReader):
         to_send = {key for src, key in schedule.entries if src == me}
         device = self._resolved_device()
 
-        capture = _CapturingPlanner(planner, to_send, device) if to_send else None
+        capture = (
+            _CapturingPlanner(planner, to_send, device, self._metadata)
+            if to_send
+            else None
+        )
         inner_plan = dataclasses.replace(plan, storage_data=schedule.inner)
         started = time.perf_counter()
         self.storage_reader.read_data(inner_plan, capture or planner).wait()
@@ -841,7 +854,11 @@ class ReplicaAwareStorageReader(StorageReader):
         group = self.group
         for src, key in schedule.entries:
             if src == me:
-                buffer = captured[key]
+                # pop: once broadcast, the owner has no further use for its
+                # copy. ProcessGroupNCCL records the stream on the tensor, so
+                # the allocator will not reuse the block before the collective
+                # has consumed it.
+                buffer = captured.pop(key)
             else:
                 # Receivers and bystanders both have to join the collective;
                 # bystanders discard their buffer.
@@ -868,7 +885,7 @@ class ReplicaAwareStorageReader(StorageReader):
             if src == me:
                 offset = 0
                 for key, count in zip(keys, counts):
-                    flat[offset : offset + count].copy_(captured[key].reshape(-1))
+                    flat[offset : offset + count].copy_(captured.pop(key).reshape(-1))
                     offset += count
             dist.broadcast(flat, src=src, group=group)
             self.num_broadcasts += 1

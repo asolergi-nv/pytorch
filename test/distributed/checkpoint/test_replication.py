@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import filesystem as dcp_filesystem
+from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.filesystem import FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.metadata import (
@@ -820,10 +821,48 @@ class TestReplicaAwareLoad(DTensorTestBase):
 
         # Now break the exchange: nothing a rank needs from a peer gets filled,
         # and validate has to notice rather than return a half-loaded state dict.
+        # CheckpointException derives from BaseException, so it has to be named:
+        # `assertRaises(Exception)` would let it through and kill the process.
         broken = self._reader(path, mesh["dp"].get_group(), validate=True)
         broken._fill = lambda *args, **kwargs: None
-        with self.assertRaisesRegex(Exception, "did not satisfy"):
+        with self.assertRaisesRegex(CheckpointException, "did not satisfy"):
             dcp.load(self._zeros_like(sd), storage_reader=broken)
+
+        dist.barrier()
+        if self.rank == 0:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @with_comms
+    def test_load_into_a_different_dtype(self):
+        """A load may cast: fp32 on disk into a bf16 model is legal DCP.
+
+        The exchange has to carry the *stored* dtype, which is what every
+        receiver sizes its buffer from. Capturing the destination instead would
+        broadcast bf16 into fp32 buffers and corrupt or fault; casting belongs
+        at each receiver's own destination copy.
+        """
+        mesh = self._mesh(self.world_size, 1)
+        sd = self._state_dict(mesh)
+        path = self._tmpdir()
+        dcp.save(sd, storage_writer=FileSystemWriter(path, thread_count=1))
+
+        target = {
+            k: DTensor.from_local(
+                torch.zeros(v.to_local().shape, dtype=torch.bfloat16, device=v.device),
+                device_mesh=v.device_mesh,
+                placements=v.placements,
+                shape=v.size(),
+                stride=v.stride(),
+            )
+            for k, v in sd.items()
+        }
+        reader = self._reader(path, mesh["dp"].get_group())
+        dcp.load(target, storage_reader=reader)
+
+        self.assertGreater(reader.num_broadcasts, 0)
+        for k in sd:
+            self.assertEqual(target[k].to_local().dtype, torch.bfloat16)
+            self.assertEqual(sd[k].to_local().to(torch.bfloat16), target[k].to_local())
 
         dist.barrier()
         if self.rank == 0:
