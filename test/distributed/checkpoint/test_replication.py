@@ -1,9 +1,12 @@
 # Owner(s): ["oncall: distributed_checkpointing"]
 
 import contextlib
+import importlib.util
 import shutil
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -26,8 +29,8 @@ from torch.distributed.checkpoint.replication import (
     _load_nixl,
     _rdma_buffer,
     _read_key,
+    _sort_key,
     _waves,
-    _write_sort_key,
     ReplicaAwareStorageReader,
     ReplicaAwareStorageWriter,
     ReplicationOptions,
@@ -42,11 +45,11 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 def _tensor_key(fqn, offsets, lengths):
-    return (MetadataIndex(fqn, torch.Size(offsets)), torch.Size(offsets), torch.Size(lengths))
-
-
-def _sort_key(key):
-    return (key[0].fqn, tuple(key[0].offset or ()), tuple(key[1]), tuple(key[2]))
+    return (
+        MetadataIndex(fqn, torch.Size(offsets)),
+        torch.Size(offsets),
+        torch.Size(lengths),
+    )
 
 
 def _sizes(needers):
@@ -72,9 +75,7 @@ def _fake_metadata(keys, dtype=torch.float32):
                 chunks=[],
             ),
         )
-        md[fqn].chunks.append(
-            ChunkStorageMetadata(offsets=key[0].offset, sizes=key[2])
-        )
+        md[fqn].chunks.append(ChunkStorageMetadata(offsets=key[0].offset, sizes=key[2]))
     return Metadata(state_dict_metadata=md)
 
 
@@ -123,7 +124,9 @@ class TestReplicationElection(TestCase):
         reference = _elect_owners(needers, _sizes(needers), 4, _sort_key)
         for _ in range(50):
             shuffled = {k: list(needers[k]) for k in reversed(keys)}
-            self.assertEqual(_elect_owners(shuffled, _sizes(shuffled), 4, _sort_key), reference)
+            self.assertEqual(
+                _elect_owners(shuffled, _sizes(shuffled), 4, _sort_key), reference
+            )
 
     def test_election_never_drops_and_stays_in_the_replica_set(self):
         keys = [_tensor_key(f"w{i}", [i, 0], [4, 4]) for i in range(12)]
@@ -136,7 +139,9 @@ class TestReplicationElection(TestCase):
 
     def test_election_balances_uniform_replicas(self):
         keys = [_tensor_key(f"w{i}", [i, 0], [8, 8]) for i in range(8)]
-        owners = _elect_owners({k: [0, 1, 2, 3] for k in keys}, _sizes({k: 0 for k in keys}), 4, _sort_key)
+        owners = _elect_owners(
+            {k: [0, 1, 2, 3] for k in keys}, _sizes({k: 0 for k in keys}), 4, _sort_key
+        )
 
         per_rank = [0] * 4
         for owner in owners.values():
@@ -249,10 +254,16 @@ class TestReplicationElection(TestCase):
             ReplicationOptions(bucket_bytes=-1)
 
     def test_missing_nixl_says_what_to_install(self):
-        try:
-            _load_nixl()
-        except RuntimeError as exc:
-            self.assertIn("pip install nixl", str(exc))
+        # A None entry in sys.modules makes the import raise ModuleNotFoundError,
+        # so this exercises the missing-package path whether or not nixl is
+        # actually installed.
+        absent = {}
+        for package in ("nixl_cu13", "nixl_cu12", "nixl"):
+            absent[package] = None
+            absent[f"{package}._api"] = None
+        with mock.patch.dict(sys.modules, absent):
+            with self.assertRaisesRegex(RuntimeError, "pip install nixl"):
+                _load_nixl()
 
     def test_rejects_bad_options(self):
         with self.assertRaises(ValueError):
@@ -261,6 +272,11 @@ class TestReplicationElection(TestCase):
             ReplicationOptions(dedup_bytes=True)
 
     @unittest.skipIf(not torch.cuda.is_available(), "needs a GPU")
+    @unittest.skipIf(
+        importlib.util.find_spec("cuda") is None
+        or importlib.util.find_spec("cuda.bindings") is None,
+        "needs cuda-python",
+    )
     def test_rdma_buffer_survives_expandable_segments(self):
         # The arena is registered for one-sided RDMA, and legacy CUDA IPC is not
         # valid on the cuMemMap ranges the caching allocator hands out under
@@ -303,9 +319,12 @@ class TestReplicaAwareLoad(DTensorTestBase):
     def _state_dict(self, mesh, n=4, dim=256, shard_tp=True):
         sd = {}
         for i in range(n):
-            full = torch.arange(
-                dim * dim, dtype=torch.float32, device=self.device_type
-            ).reshape(dim, dim) + i
+            full = (
+                torch.arange(
+                    dim * dim, dtype=torch.float32, device=self.device_type
+                ).reshape(dim, dim)
+                + i
+            )
             placements = [Replicate(), Shard(0) if shard_tp else Replicate()]
             sd[f"layer{i}.weight"] = distribute_tensor(full, mesh, placements)
         return sd
@@ -324,9 +343,7 @@ class TestReplicaAwareLoad(DTensorTestBase):
         }
 
     def _mesh(self, dp, tp):
-        return init_device_mesh(
-            self.device_type, (dp, tp), mesh_dim_names=("dp", "tp")
-        )
+        return init_device_mesh(self.device_type, (dp, tp), mesh_dim_names=("dp", "tp"))
 
     def _reader(self, path, group, **kwargs):
         return ReplicaAwareStorageReader(
@@ -450,7 +467,9 @@ class TestReplicaAwareLoad(DTensorTestBase):
         ).reshape(dim, dim)
         unique = shared + 1
         sd = {
-            "shared.weight": distribute_tensor(shared, mesh, [Replicate(), Replicate()]),
+            "shared.weight": distribute_tensor(
+                shared, mesh, [Replicate(), Replicate()]
+            ),
             "unique.weight": distribute_tensor(unique, mesh, [Shard(0), Replicate()]),
         }
         path = self._tmpdir()
@@ -610,6 +629,7 @@ class TestReplicaAwareLoad(DTensorTestBase):
         dist.barrier()
         if self.rank == 0:
             shutil.rmtree(path, ignore_errors=True)
+
     @with_comms
     def test_bucketing_loads_the_same_values_with_fewer_broadcasts(self):
         mesh = self._mesh(self.world_size, 1)
@@ -737,19 +757,27 @@ class TestReplicaAwareLoad(DTensorTestBase):
 
     @with_comms
     def test_non_uniform_group_falls_back_to_gathering_keys(self):
-        """Resharding breaks the uniformity assumption, so the gather must return.
+        """A group whose members want different keys must gather them.
 
-        Saved sharded and loaded replicated: the ranks of a dp group then want
-        different stored chunks, the digests disagree, and correctness depends
-        on falling back rather than assuming everyone wants everything.
+        One tensor is sharded across the dp group, so each rank's key set
+        differs, the digests disagree, and the election has to fall back to
+        gathering the key lists instead of assuming everyone wants everything.
         """
-        mesh_save = self._mesh(1, self.world_size)
-        sd = self._state_dict(mesh_save, n=4, dim=64)
+        mesh = self._mesh(self.world_size, 1)
+        dim = 64
+        shared = torch.arange(
+            dim * dim, dtype=torch.float32, device=self.device_type
+        ).reshape(dim, dim)
+        sd = {
+            "shared.weight": distribute_tensor(
+                shared, mesh, [Replicate(), Replicate()]
+            ),
+            "unique.weight": distribute_tensor(
+                shared + 1, mesh, [Shard(0), Replicate()]
+            ),
+        }
         path = self._tmpdir()
         dcp.save(sd, storage_writer=FileSystemWriter(path, thread_count=1))
-
-        mesh_load = self._mesh(self.world_size, 1)
-        expected = self._state_dict(mesh_load, n=4, dim=64)
 
         gathered_key_lists = []
         original = dist.all_gather_object
@@ -759,15 +787,20 @@ class TestReplicaAwareLoad(DTensorTestBase):
                 gathered_key_lists.append(obj)
             return original(object_list, obj, group=group, **kwargs)
 
-        target = self._zeros_like(expected)
-        reader = self._reader(path, mesh_load["dp"].get_group(), election="group")
+        target = self._zeros_like(sd)
+        reader = self._reader(path, mesh["dp"].get_group(), election="group")
         dist.all_gather_object = counting
         try:
             dcp.load(target, storage_reader=reader, no_dist=True)
         finally:
             dist.all_gather_object = original
 
-        self._assert_equal_sd(expected, target)
+        self._assert_equal_sd(sd, target)
+        self.assertEqual(
+            len(gathered_key_lists),
+            1,
+            "digests differ, so the key lists must be gathered",
+        )
 
         dist.barrier()
         if self.rank == 0:
@@ -785,10 +818,16 @@ class TestReplicaAwareLoad(DTensorTestBase):
         dcp.load(target, storage_reader=reader)  # clean run must not raise
         self._assert_equal_sd(sd, target)
 
+        # Now break the exchange: nothing a rank needs from a peer gets filled,
+        # and validate has to notice rather than return a half-loaded state dict.
+        broken = self._reader(path, mesh["dp"].get_group(), validate=True)
+        broken._fill = lambda *args, **kwargs: None
+        with self.assertRaisesRegex(Exception, "did not satisfy"):
+            dcp.load(self._zeros_like(sd), storage_reader=broken)
+
         dist.barrier()
         if self.rank == 0:
             shutil.rmtree(path, ignore_errors=True)
-
 
 
 class TestReplicaAwareSave(DTensorTestBase):
@@ -830,11 +869,14 @@ class TestReplicaAwareSave(DTensorTestBase):
         dist.barrier()
         total = 0.0
         if self.rank == 0:
-            total = sum(
-                os.path.getsize(os.path.join(path, f))
-                for f in os.listdir(path)
-                if f.endswith(".distcp")
-            ) / 2**20
+            total = (
+                sum(
+                    os.path.getsize(os.path.join(path, f))
+                    for f in os.listdir(path)
+                    if f.endswith(".distcp")
+                )
+                / 2**20
+            )
         box = [total]
         dist.broadcast_object_list(box, src=0)
         return box[0]
@@ -997,6 +1039,7 @@ class TestReplicaAwareSave(DTensorTestBase):
         dist.barrier()
         if self.rank == 0:
             shutil.rmtree(path, ignore_errors=True)
+
 
 if __name__ == "__main__":
     run_tests()

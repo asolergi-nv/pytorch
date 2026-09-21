@@ -36,9 +36,8 @@ import time
 import types
 import warnings
 from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -56,8 +55,16 @@ from torch.distributed.checkpoint.planner import (
     SavePlanner,
     WriteItem,
 )
-from torch.distributed.checkpoint.storage import StorageReader, StorageWriter, WriteResult
+from torch.distributed.checkpoint.storage import (
+    StorageReader,
+    StorageWriter,
+    WriteResult,
+)
 from torch.futures import Future
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 __all__ = [
@@ -178,12 +185,17 @@ def _fingerprint(payload: str) -> int:
     a silent mis-election rather than a stale cache. 63 bits keeps it inside a
     signed int64, which is what the collective moves.
     """
-    return int.from_bytes(hashlib.blake2b(payload.encode(), digest_size=8).digest(), "big") >> 1
+    return (
+        int.from_bytes(hashlib.blake2b(payload.encode(), digest_size=8).digest(), "big")
+        >> 1
+    )
 
 
 def _digest(keys: list[_ReadKey]) -> int:
     """Stable fingerprint of a key set."""
-    return _fingerprint("|".join(repr(_sort_key(k)) for k in sorted(keys, key=_sort_key)))
+    return _fingerprint(
+        "|".join(repr(_sort_key(k)) for k in sorted(keys, key=_sort_key))
+    )
 
 
 def _collective_device(group) -> torch.device:
@@ -202,12 +214,10 @@ def _collective_device(group) -> torch.device:
 
 
 def _gather_digests(value: int, group, group_size: int) -> tuple[int, ...]:
-    """all_gather one integer per rank without pickling anything.
+    """all_gather one integer per rank as a fixed-shape int64 tensor.
 
-    `all_gather_object` would serialise a Python object, and on a real plan that
-    pickling *is* the cost: 1.8 s of a 14 s 16B load for a two-rank group moving
-    about 480 KB. A fixed-shape int64 tensor is something the collective moves
-    directly. Written as a masked all_reduce because every backend supports it.
+    Written as a masked all_reduce because every backend supports it, and it
+    keeps Python objects off the wire.
     """
     slot = torch.zeros(group_size, dtype=torch.int64, device=_collective_device(group))
     slot[dist.get_rank(group)] = value
@@ -217,7 +227,9 @@ def _gather_digests(value: int, group, group_size: int) -> tuple[int, ...]:
 
 def _payload_digest(payload: list[tuple[MetadataIndex, int]]) -> int:
     """Stable fingerprint of a write plan's (index, size) pairs."""
-    return _fingerprint("|".join(sorted(f"{_write_sort_key(i)}:{n}" for i, n in payload)))
+    return _fingerprint(
+        "|".join(sorted(f"{_write_sort_key(i)}:{n}" for i, n in payload))
+    )
 
 
 def _elect_owners(
@@ -235,9 +247,7 @@ def _elect_owners(
     """
     assigned = [0] * num_ranks
     owners: dict[Any, int] = {}
-    order = sorted(
-        needers, key=lambda k: (len(needers[k]), -sizes[k], tiebreak(k))
-    )
+    order = sorted(needers, key=lambda k: (len(needers[k]), -sizes[k], tiebreak(k)))
     for key in order:
         chosen = min(needers[key], key=lambda r: (assigned[r], r))
         owners[key] = chosen
@@ -335,7 +345,7 @@ class ReplicationOptions:
     """
 
     election: str = "coordinator"
-    exchange_device: Optional[torch.device] = None
+    exchange_device: torch.device | None = None
     dedup_bytes: bool = False
     validate: bool = False
     enable_plan_caching: bool = False
@@ -362,10 +372,17 @@ class ReplicationOptions:
 
 @dataclass
 class _Tag:
-    """Rides DCP's existing plan gather so the coordinator learns the groups."""
+    """Rides DCP's existing plan gather so the coordinator learns the groups.
+
+    ``global_rank`` is the tagging rank's ``dist.get_rank()``. The coordinator
+    receives plans indexed by rank *within the process group dcp.load was
+    given*, which is not the global rank unless that group is WORLD, while
+    ``group_ranks`` are global -- so the tag carries the one that matches.
+    """
 
     inner: Any
     group_ranks: tuple[int, ...]
+    global_rank: int
 
 
 @dataclass
@@ -455,14 +472,12 @@ class ReplicaAwareStorageReader(StorageReader):
         self,
         storage_reader: StorageReader,
         *,
-        replication_group: Optional[dist.ProcessGroup] = None,
-        replication_ranks: Optional[list[list[int]]] = None,
-        options: Optional[ReplicationOptions] = None,
+        replication_group: dist.ProcessGroup | None = None,
+        replication_ranks: list[list[int]] | None = None,
+        options: ReplicationOptions | None = None,
     ) -> None:
         if replication_group is not None and replication_ranks is not None:
-            raise ValueError(
-                "pass replication_group or replication_ranks, not both"
-            )
+            raise ValueError("pass replication_group or replication_ranks, not both")
         self.storage_reader = storage_reader
         self.options = options or ReplicationOptions()
         self._group = replication_group
@@ -471,12 +486,11 @@ class ReplicaAwareStorageReader(StorageReader):
             if replication_ranks is not None
             else None
         )
-        self._metadata: Optional[Metadata] = None
+        self._metadata: Metadata | None = None
         self._local_items: list[ReadItem] = []
-        self._local_schedule: Optional[_Schedule] = None
-        self._exchange_device: Optional[torch.device] = None
+        self._local_schedule: _Schedule | None = None
+        self._exchange_device: torch.device | None = None
         self._cache: dict[str, Any] = {}
-        self._dcp_rank: Optional[int] = None
 
         # Observability, kept cheap so callers can assert on it in tests.
         self.num_broadcasts = 0
@@ -496,7 +510,7 @@ class ReplicaAwareStorageReader(StorageReader):
         return self._group
 
     @property
-    def checkpoint_id(self) -> Union[str, os.PathLike]:
+    def checkpoint_id(self) -> str | os.PathLike:
         return self.storage_reader.checkpoint_id
 
     def reset(self, checkpoint_id=None) -> None:
@@ -511,7 +525,6 @@ class ReplicaAwareStorageReader(StorageReader):
         self, metadata: Metadata, is_coordinator: bool, *args: Any, **kwargs: Any
     ) -> None:
         self._metadata = metadata
-        self._dcp_rank = kwargs.get("rank")
         self.storage_reader.set_up_storage_reader(
             metadata, is_coordinator, *args, **kwargs
         )
@@ -537,7 +550,11 @@ class ReplicaAwareStorageReader(StorageReader):
         return device
 
     def _enabled(self) -> bool:
-        return dist.is_available() and dist.is_initialized() and dist.get_world_size(self.group) > 1
+        return (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size(self.group) > 1
+        )
 
     # -- planning ----------------------------------------------------------
 
@@ -553,21 +570,22 @@ class ReplicaAwareStorageReader(StorageReader):
 
         if self.options.election == "coordinator":
             ranks = tuple(dist.get_process_group_ranks(self.group))
-            return dataclasses.replace(plan, storage_data=_Tag(plan.storage_data, ranks))
+            tag = _Tag(plan.storage_data, ranks, dist.get_rank())
+            return dataclasses.replace(plan, storage_data=tag)
 
         return self._elect_within_group(plan)
 
     def _elect_within_group(self, plan: LoadPlan) -> LoadPlan:
         if self._metadata is None:
-            raise AssertionError("set_up_storage_reader must run before prepare_local_plan")
+            raise AssertionError(
+                "set_up_storage_reader must run before prepare_local_plan"
+            )
         group = self.group
         group_size = dist.get_world_size(group)
         group_ranks = tuple(dist.get_process_group_ranks(group))
         my_rank = dist.get_rank(group)
 
-        keys = [
-            _read_key(i) for i in plan.items if i.type is not LoadItemType.BYTE_IO
-        ]
+        keys = [_read_key(i) for i in plan.items if i.type is not LoadItemType.BYTE_IO]
         owners, entries = self._group_election(keys, group, group_size, group_ranks)
 
         self._local_schedule = _Schedule(plan.storage_data, entries)
@@ -582,13 +600,11 @@ class ReplicaAwareStorageReader(StorageReader):
     def _group_election(self, keys, group, group_size, group_ranks):
         """Elect owners inside the replication group.
 
-        Shipping every rank's key list was the second largest cost in a load
-        after the storage read -- 1.8 s of a 14 s 16B load, nearly all of it
-        pickling -- and it is usually unnecessary. In a replication group every
-        member wants the same keys, which is what the group *is*, and one
-        fixed-size all_gather of digests establishes that. When the digests
-        agree, ``needers`` is "all ranks" for every key, which each rank already
-        knows, so no key data goes on the wire at all.
+        In a replication group every member wants the same keys -- that is what
+        the group *is* -- and one fixed-size exchange of digests establishes it.
+        When they agree, ``needers`` is "all ranks" for every key, which each
+        rank already knows, so no key data goes on the wire. The key lists are
+        gathered only when the digests disagree.
         """
         digests = _gather_digests(_digest(keys), group, group_size)
 
@@ -604,7 +620,9 @@ class ReplicaAwareStorageReader(StorageReader):
         else:
             # Not uniformly replicated: a resharding load, or a group that is
             # not really a replication group. Fall back to the key lists.
-            logger.debug("replication: key sets differ across the group, gathering plans")
+            logger.debug(
+                "replication: key sets differ across the group, gathering plans"
+            )
             gathered: list[list[_ReadKey]] = [None] * group_size  # type: ignore[list-item]
             dist.all_gather_object(gathered, keys, group=group)
             by_key: dict[_ReadKey, list[int]] = defaultdict(list)
@@ -628,7 +646,9 @@ class ReplicaAwareStorageReader(StorageReader):
         if not self._enabled() or self.options.election != "coordinator":
             return self.storage_reader.prepare_global_plan(plans)
         if self._metadata is None:
-            raise AssertionError("set_up_storage_reader must run before prepare_global_plan")
+            raise AssertionError(
+                "set_up_storage_reader must run before prepare_global_plan"
+            )
 
         plans = self.storage_reader.prepare_global_plan(plans)
         tags: list[_Tag] = [p.storage_data for p in plans]
@@ -645,34 +665,32 @@ class ReplicaAwareStorageReader(StorageReader):
                 for p, t in zip(plans, tags)
             ]
 
-        group_of = {r: t.group_ranks for r, t in enumerate(tags)}
         per_group: dict[tuple[int, ...], dict[_ReadKey, list[int]]] = defaultdict(
             lambda: defaultdict(list)
         )
-        for rank, plan in enumerate(plans):
-            group = group_of[rank]
-            local_rank = group.index(rank)
+        for plan, tag in zip(plans, tags):
+            local_rank = tag.group_ranks.index(tag.global_rank)
             for item in plan.items:
                 if item.type is not LoadItemType.BYTE_IO:
-                    per_group[group][_read_key(item)].append(local_rank)
+                    per_group[tag.group_ranks][_read_key(item)].append(local_rank)
 
         owners_of, schedule_of = self._coordinator_election(per_group)
 
         out: list[LoadPlan] = []
-        for rank, plan in enumerate(plans):
-            group = group_of[rank]
+        for plan, tag in zip(plans, tags):
+            group = tag.group_ranks
             owners = owners_of.get(group, {})
             keep = [
                 i
                 for i in plan.items
                 if i.type is LoadItemType.BYTE_IO
-                or group[owners[_read_key(i)]] == rank
+                or group[owners[_read_key(i)]] == tag.global_rank
             ]
             out.append(
                 dataclasses.replace(
                     plan,
                     items=keep,
-                    storage_data=_Schedule(tags[rank].inner, schedule_of[group]),
+                    storage_data=_Schedule(tag.inner, schedule_of[group]),
                 )
             )
         return out
@@ -685,12 +703,16 @@ class ReplicaAwareStorageReader(StorageReader):
             group: _fingerprint(
                 "|".join(
                     f"{_sort_key(k)}:{sorted(ranks)}"
-                    for k, ranks in sorted(needers.items(), key=lambda kv: _sort_key(kv[0]))
+                    for k, ranks in sorted(
+                        needers.items(), key=lambda kv: _sort_key(kv[0])
+                    )
                 )
             )
             for group, needers in per_group.items()
         }
-        cached = self._cache.get("coordinator") if self.options.enable_plan_caching else None
+        cached = (
+            self._cache.get("coordinator") if self.options.enable_plan_caching else None
+        )
         if cached is not None and cached[0] == signature:
             logger.debug("replication: reusing cached coordinator election")
             return cached[1], cached[2]
@@ -721,9 +743,7 @@ class ReplicaAwareStorageReader(StorageReader):
         to_send = {key for src, key in schedule.entries if src == me}
         device = self._resolved_device()
 
-        capture = (
-            _CapturingPlanner(planner, to_send, device) if to_send else None
-        )
+        capture = _CapturingPlanner(planner, to_send, device) if to_send else None
         inner_plan = dataclasses.replace(plan, storage_data=schedule.inner)
         started = time.perf_counter()
         self.storage_reader.read_data(inner_plan, capture or planner).wait()
@@ -759,7 +779,7 @@ class ReplicaAwareStorageReader(StorageReader):
         result.set_result(None)
         return result
 
-    def _schedule_for(self, plan: LoadPlan) -> Optional[_Schedule]:
+    def _schedule_for(self, plan: LoadPlan) -> _Schedule | None:
         if not self._enabled():
             return None
         if self.options.election == "group":
@@ -885,9 +905,7 @@ class ReplicaAwareStorageReader(StorageReader):
         for wave in _waves(schedule.entries, self._metadata, arena.wave_bytes):
             for key, offset, nbytes in wave.get(me, ()):
                 dtype = _tensor_md(key, self._metadata).properties.dtype
-                arena.window(me, offset, nbytes, dtype).copy_(
-                    captured[key].reshape(-1)
-                )
+                arena.window(me, offset, nbytes, dtype).copy_(captured[key].reshape(-1))
             # A collective gave the "your peer's buffer is ready" edge for free;
             # a one-sided read does not, so the arenas are fenced explicitly.
             # Two barriers per wave replace one collective per chunk.
@@ -913,9 +931,7 @@ class ReplicaAwareStorageReader(StorageReader):
                         continue
                     dtype = _tensor_md(key, self._metadata).properties.dtype
                     buffer = arena.window(src, offset, nbytes, dtype)
-                    self._fill(
-                        key, buffer.view(tuple(key[2])), planner, needed, filled
-                    )
+                    self._fill(key, buffer.view(tuple(key[2])), planner, needed, filled)
                     self.bytes_exchanged += nbytes
 
             if device.type == "cuda" and torch.cuda.is_available():
@@ -942,7 +958,7 @@ def _load_nixl():
 # One agent and one registration per (group, device); creating them is far more
 # expensive than a load, and a second agent on the same device would re-pay
 # ibv_reg_mr for nothing.
-_NIXL_CONTEXTS: dict[tuple, "_NixlArena"] = {}
+_NIXL_CONTEXTS: dict[tuple, _NixlArena] = {}
 
 
 def _rdma_buffer(nbytes: int, device: torch.device) -> tuple[torch.Tensor, int]:
@@ -1168,9 +1184,9 @@ class ReplicaAwareStorageWriter(StorageWriter):
         self,
         storage_writer: StorageWriter,
         *,
-        replication_group: Optional[dist.ProcessGroup] = None,
-        replication_ranks: Optional[list[list[int]]] = None,
-        options: Optional[ReplicationOptions] = None,
+        replication_group: dist.ProcessGroup | None = None,
+        replication_ranks: list[list[int]] | None = None,
+        options: ReplicationOptions | None = None,
     ) -> None:
         if replication_group is not None and replication_ranks is not None:
             raise ValueError("pass replication_group or replication_ranks, not both")
@@ -1194,7 +1210,7 @@ class ReplicaAwareStorageWriter(StorageWriter):
         return self._group
 
     @property
-    def checkpoint_id(self) -> Union[str, os.PathLike]:
+    def checkpoint_id(self) -> str | os.PathLike:
         return self.storage_writer.checkpoint_id
 
     def _enabled(self) -> bool:
